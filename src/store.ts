@@ -31,6 +31,7 @@ import {
   resolveCollectionId,
   resolveCollectionIds,
   rowidList,
+  storedEmbedding,
   storedEmbeddingLookup,
   upsertPartitionVector,
   vecInteger,
@@ -72,6 +73,7 @@ import type {
   ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
+import { computeCentroid, computeCentroidFromFloat32, type CentroidConfig, DEFAULT_CENTROID_CONFIG } from "./centroid.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
 import {
   initializeMetadataSchema,
@@ -6204,6 +6206,12 @@ export interface HybridQueryOptions {
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Centroid expansion (Rocchio pseudo-relevance feedback) — thematic grouping without LLM */
+  expandCentroid?: boolean;
+  centroidK?: number; // top-k RRF results to form centroid (default 3)
+  centroidWeight?: number; // RRF weight for centroid list (default 1.0)
+  centroidVectorTopK?: number; // vector top-k for centroid search (default 20)
+  centroidConfig?: CentroidConfig; // full config override
 }
 
 export interface HybridQueryResult {
@@ -6269,19 +6277,32 @@ export function fetchWinnerChunks(
 ): Map<string, string> {
   const texts = new Map<string, string>();
   for (const w of winners) {
-    const fp = w.file.startsWith('qmd://') ? w.file.slice(6) : w.file;
+    const split = splitCollectionPath(w.file);
+    if (!split) continue;
     const pos = Math.max(0, w.chunkPos ?? 0);
     try {
+      // Indexed lookup: matches the existing (collection, path) index.
+      // Never concatenate collection || '/' || path — no index covers
+      // that expression and each lookup degrades to a documents scan.
       const row = db.prepare(
-        `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE d.collection || '/' || d.path = ? AND d.active = 1 LIMIT 1`
-      ).get(pos + 1, chunkChars, fp) as { text: string } | undefined
-        ?? db.prepare(
-          `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE 'qmd://' || d.collection || '/' || d.path = ? AND d.active = 1 LIMIT 1`
-        ).get(pos + 1, chunkChars, w.file) as { text: string } | undefined;
+        `SELECT substr(c.doc, ?, ?) as text FROM documents d JOIN content c ON c.hash = d.hash WHERE d.collection = ? AND d.path = ? AND d.active = 1 LIMIT 1`
+      ).get(pos + 1, chunkChars, split[0], split[1]) as { text: string } | undefined;
       if (row?.text) texts.set(w.file, row.text);
     } catch {}
   }
   return texts;
+}
+
+/**
+ * Split a result filepath into [collection, path] for indexed lookups.
+ * Accepts `qmd://collection/path` and bare `collection/path` forms.
+ * Returns null when no collection segment is present.
+ */
+export function splitCollectionPath(file: string): [string, string] | null {
+  const bare = file.startsWith('qmd://') ? file.slice(6) : file;
+  const slash = bare.indexOf('/');
+  if (slash <= 0) return null;
+  return [bare.slice(0, slash), bare.slice(slash + 1)];
 }
 
 export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] {
@@ -6436,9 +6457,143 @@ export async function hybridQuery(
 
   // Step 4: RRF fusion — original-query FTS and vector lists get 2x weight;
   // expansion-derived lists stay at 1x independent of insertion order.
-  const weights = getHybridRrfWeights(rankedListMeta);
-  const fused = reciprocalRankFusion(rankedLists, weights);
-  const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  let weights = getHybridRrfWeights(rankedListMeta);
+  let fused = reciprocalRankFusion(rankedLists, weights);
+  let rrfTraceByFile: Map<string, any> | null = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  // Step 4b: Centroid expansion (Rocchio pseudo-relevance feedback).
+  // When enabled, the top-ranked files vote on the query's theme: embed
+  // their winning chunks, average into a centroid vector, and search it
+  // for files the keyword ranking missed.
+  const centroidCfg = options?.centroidConfig ?? DEFAULT_CENTROID_CONFIG;
+  const centroidK = options?.centroidK ?? centroidCfg.topKForCentroid;
+  const centroidWeight = options?.centroidWeight ?? centroidCfg.weight;
+  const centroidVectorTopK = options?.centroidVectorTopK ?? centroidCfg.vectorTopK;
+  const lowRecall = fused.length <= 6 || topScore < 0.35;
+  const shouldCentroid = (options?.expandCentroid ?? (centroidCfg.enabled || lowRecall)) && hasVectors && fused.length > 0;
+
+  if (shouldCentroid) {
+    const centroidStart = Date.now();
+    const topK = Math.min(Math.max(1, centroidK), fused.length);
+    const topCandidates = fused.slice(0, topK);
+
+    // Fetch each top file's winning chunk text to seed the centroid.
+    const fileBodyMap = fetchWinnerChunks(
+      store.db,
+      topCandidates.map(c => ({ file: c.file, chunkPos: c.chunkPos })),
+    );
+
+    // The seeds are the winning chunk texts of the top-ranked files.
+    const seedChunks: string[] = [];
+    const seedFiles: string[] = [];
+
+    for (const c of topCandidates) {
+      // Each fetched slice is already that file's winning chunk text.
+      const bestChunk = fileBodyMap.get(c.file) || "";
+      if (bestChunk.trim()) {
+        seedChunks.push(bestChunk);
+        seedFiles.push(c.file);
+      }
+    }
+
+    if (seedChunks.length > 0) {
+      let centroidVec: Float32Array | null = null;
+
+      // Stored-vector path: reuse the chunk embeddings already stored in
+      // the vector index instead of re-embedding, avoiding a model load.
+      try {
+        const modelName = DEFAULT_EMBED_MODEL;
+        const fingerprint = getEmbeddingFingerprint(modelName);
+        const storedEmbeddings: Float32Array[] = [];
+
+        for (let i = 0; i < seedFiles.length; i++) {
+          const file = seedFiles[i]!;
+          // Indexed lookup via split collection/path (see fetchWinnerChunks:
+          // never match on collection || '/' || path, no index covers it).
+          const split = splitCollectionPath(file);
+          if (!split) continue;
+          const docRow = store.db.prepare(
+            `SELECT hash FROM documents WHERE collection = ? AND path = ? AND active = 1 LIMIT 1`
+          ).get(split[0], split[1]) as { hash: string } | undefined;
+
+          if (!docRow) continue;
+
+          // Use the first chunk's stored embedding as this file's vote.
+          const cvRows = store.db.prepare(
+            `SELECT seq FROM content_vectors WHERE hash = ? AND model = ? AND embed_fingerprint = ? ORDER BY seq LIMIT 5`
+          ).all(docRow.hash, modelName, fingerprint) as { seq: number }[];
+
+          for (const cv of cvRows.slice(0, 1)) { // first chunk per file votes in the centroid
+            // Partition-aware read: vectors_vec is gone under the
+            // partitioned layout, so go through storedEmbedding().
+            const bytes = storedEmbedding(store.db, docRow.hash, cv.seq);
+            if (!bytes) continue;
+            // Stored embeddings arrive as raw blob bytes: reinterpret as float32.
+            const emb = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+            if (emb.length > 0) storedEmbeddings.push(emb);
+          }
+        }
+
+        if (storedEmbeddings.length === seedChunks.length && storedEmbeddings.length > 0) {
+          // All seeds were already embedded: average them directly.
+          centroidVec = computeCentroidFromFloat32(storedEmbeddings);
+        }
+      } catch {
+        // Stored embeddings were missing or mismatched; fall through to re-embed.
+      }
+
+      // Fallback: embed the seed chunks now (a few ms on CPU for 3 chunks).
+      if (!centroidVec) {
+        try {
+          const llmForCentroid = getLlm(store);
+          const embedModel = llmForCentroid.embedModelName;
+          const formatted = seedChunks.map(t => formatDocForEmbedding(t, undefined, embedModel));
+          const embResults = await llmForCentroid.embedBatch(formatted);
+          const validEmbs: number[][] = [];
+          for (const r of embResults) if (r?.embedding) validEmbs.push(r.embedding);
+          if (validEmbs.length > 0) {
+            centroidVec = computeCentroid(validEmbs);
+          }
+        } catch {
+          // Embedding failed; return the keyword ranking unchanged.
+        }
+      }
+
+      // Search the centroid vector for files near the top-ranked theme.
+      const centroidVecSearchStart = Date.now();
+      if (centroidVec) {
+        try {
+          const centroidResults = await store.searchVec(
+            "__centroid__",
+            (getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL),
+            centroidVectorTopK,
+            collection,
+            undefined,
+            Array.from(centroidVec),
+            filter
+          );
+          if (centroidResults.length > 0) {
+            for (const r of centroidResults) docidMap.set(r.filepath, r.docid);
+            rankedLists.push(centroidResults.map(r => ({
+              file: r.filepath, displayPath: r.displayPath,
+              title: r.title, body: r.body || "", score: r.score,
+            })));
+            rankedListMeta.push({ source: "vec", queryType: "vec", query: "__centroid_expansion__" });
+            // Fuse again with the centroid list included, at its own weight.
+            weights = getHybridRrfWeights(rankedListMeta);
+            // Give the centroid list its configured weight rather than the default.
+            weights[weights.length - 1] = centroidWeight;
+            fused = reciprocalRankFusion(rankedLists, weights);
+            if (explain) {
+              rrfTraceByFile = buildRrfTrace(rankedLists, weights, rankedListMeta);
+            }
+          }
+        } catch {
+          // Centroid search failed; keep the keyword-fused ranking.
+        }
+      }
+    }
+  }
+
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -6710,6 +6865,12 @@ export interface StructuredSearchOptions {
   skipRerank?: boolean;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Centroid expansion (Rocchio) */
+  expandCentroid?: boolean;
+  centroidK?: number;
+  centroidWeight?: number;
+  centroidVectorTopK?: number;
+  centroidConfig?: CentroidConfig;
 }
 
 /**
